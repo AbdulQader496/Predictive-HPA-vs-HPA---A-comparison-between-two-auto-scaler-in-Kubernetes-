@@ -1,0 +1,48 @@
+name: CI/CD Pipeline - Build & Push Docker Images
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-push:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & push Go service image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./go-service
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/urlshortner-go:latest
+
+      - name: Build & push Python service image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./python-service
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/urlshortner-python:latest
+
+      - name: Build & push Node service image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./node-service
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/urlshortner-node:latest
