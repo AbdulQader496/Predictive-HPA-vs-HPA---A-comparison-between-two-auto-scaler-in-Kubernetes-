@@ -1,25 +1,43 @@
-FROM golang:1.24-alpine
+FROM golang:1.24 AS build
 
 WORKDIR /app
 
-# Install gcc and build tools for CGO (required by go-sqlite3)
-RUN apk add --no-cache gcc musl-dev sqlite-dev
+# Enable CGO for sqlite3
+ENV CGO_ENABLED=1
 
-# Copy go mod files
-COPY go.mod go.sum ./
+# Install required system dependencies for CGO + SQLite
+RUN apt-get update && apt-get install -y \
+    gcc \
+    libc6-dev \
+    sqlite3 \
+    libsqlite3-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Download dependencies
-RUN go mod download
+# Copy go.mod first
+COPY go.mod ./
 
 # Copy source code
-COPY main.go ./
+COPY . .
 
-# Build the application with CGO enabled and proper tags for Alpine/musl
-ENV CGO_ENABLED=1
-RUN go build -tags "libsqlite3" -o urlshortener main.go
+# Download deps and generate go.sum
+RUN go mod tidy
 
-# Expose port
+# Build the binary (CGO enabled)
+RUN go build -o go-service
+
+# Runtime image
+FROM debian:bookworm-slim
+
+WORKDIR /app
+
+# Install sqlite runtime library
+RUN apt-get update && apt-get install -y \
+    sqlite3 \
+    libsqlite3-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /app/go-service .
+
 EXPOSE 8000
 
-# Run the binary
-CMD ["./urlshortener"]
+CMD ["./go-service"]

@@ -2,7 +2,7 @@ name: urlshortner-microservices
 
 services:
   redis:
-    image: redis:8-alpine
+    image: redis:7-alpine
     container_name: redis
     ports:
       - "6379:6379"
@@ -19,7 +19,7 @@ services:
       - go-data:/app
     environment:
       - PYTHON_SERVICE_URL=http://python-service:5000
-      - REDIS_URL=redis:6379
+      - REDIS_ADDR=redis:6379
     depends_on:
       - redis
 
@@ -47,8 +47,73 @@ services:
       - go-service
       - node-service
 
+
 volumes:
   redis-data:
   go-data:
   node-data:
   python-data:
+
+
+
+
+
+
+
+
+
+
+# name: urlshortner-microservices
+
+# services:
+#   redis:
+#     image: redis:8-alpine
+#     container_name: redis
+#     ports:
+#       - "6379:6379"
+#     volumes:
+#       - redis-data:/data
+#     command: redis-server --appendonly yes
+
+#   go-service:
+#     build: ./go-service
+#     container_name: go-service
+#     ports:
+#       - "8000:8000"
+#     volumes:
+#       - go-data:/app
+#     environment:
+#       - PYTHON_SERVICE_URL=http://python-service:5000
+#       - REDIS_URL=redis:6379
+#     depends_on:
+#       - redis
+
+#   node-service:
+#     build: ./node-service
+#     container_name: node-service
+#     ports:
+#       - "3000:3000"
+#     volumes:
+#       - node-data:/app
+
+#   python-service:
+#     build: ./python-service
+#     container_name: python-service
+#     ports:
+#       - "5000:5000"
+#     volumes:
+#       - python-data:/app
+#     environment:
+#       - GO_SERVICE_URL=http://go-service:8000
+#       - NODE_SERVICE_URL=http://node-service:3000
+#       - REDIS_URL=redis:6379
+#     depends_on:
+#       - redis
+#       - go-service
+#       - node-service
+
+# volumes:
+#   redis-data:
+#   go-data:
+#   node-data:
+#   python-data:
