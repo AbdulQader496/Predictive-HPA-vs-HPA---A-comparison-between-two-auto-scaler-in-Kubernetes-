@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-service
+  namespace: phpa-experiment
+  labels:
+    app: go-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: go-service
+  template:
+    metadata:
+      labels:
+        app: go-service
+    spec:
+      containers:
+        - name: go-service
+          image: go-service:test
+          imagePullPolicy: Never   # image is loaded locally into Minikube, not pulled from a registry
+          ports:
+            - containerPort: 8000
+          env:
+            - name: CPU_LOAD_ITERATIONS
+              value: "3000"        # tune this during Step 12 workload calibration
+            - name: SEED_COUNT
+              value: "1000"
+            - name: REDIS_URL
+              value: "redis:6379"   # matches the Service name for the Redis deployment below
+            - name: PUBLIC_BASE_URL
+              value: "http://10.251.70.226:8000"   # VM's external IP - update if it changes
+          resources:
+            requests:
+              cpu: "100m"          # HPA calculates utilization % relative to this value
+              memory: "64Mi"
+            limits:
+              cpu: "300m"
+              memory: "128Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          # Deliberately no volumeMounts here - each pod gets its own ephemeral
+          # container filesystem, so go.db is freshly and identically seeded
+          # on every pod startup (see seedDatabase() in main.go). This avoids
+          # SQLite write-contention issues that a shared volume would introduce
+          # across replicas.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: go-service
+  namespace: phpa-experiment
+spec:
+  selector:
+    app: go-service
+  ports:
+    - protocol: TCP
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: phpa-experiment
+  labels:
+    app: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: phpa-experiment
+spec:
+  selector:
+    app: redis
+  ports:
+    - protocol: TCP
+      port: 6379
+      targetPort: 6379
+  type: ClusterIP

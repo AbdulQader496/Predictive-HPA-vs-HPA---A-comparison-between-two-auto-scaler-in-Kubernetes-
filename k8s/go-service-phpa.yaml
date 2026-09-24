@@ -1,0 +1,48 @@
+apiVersion: jamiethompson.me/v1alpha1
+kind: PredictiveHorizontalPodAutoscaler
+metadata:
+  name: go-service-phpa
+  namespace: phpa-experiment
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: go-service
+
+
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+
+
+  syncPeriod: 15000
+  decisionType: maximum
+
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+
+  models:
+    - type: Linear
+      name: go-service-linear
+      calculationTimeout: 10000
+      linear:
+        historySize: 6
+        lookAhead: 15000

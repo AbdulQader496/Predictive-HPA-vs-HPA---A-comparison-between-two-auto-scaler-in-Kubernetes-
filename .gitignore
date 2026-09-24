@@ -14,3 +14,9 @@ __pycache__/
 # NodeJS
 node_modules/
 package-lock.json
+
+# Compiled Go binary
+go-service/urlshortener
+
+# Experiment run data (kept locally only)
+k8s/results*/
