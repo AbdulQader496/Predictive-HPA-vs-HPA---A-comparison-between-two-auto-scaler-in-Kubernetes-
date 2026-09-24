@@ -1,598 +1,330 @@
-# URL Shortener - Microservice Architecture Demo
+# HPA vs PHPA Autoscaling Experiment
 
-A production-ready microservice-based URL shortener demonstrating proper service separation with four independent services: Go for high-performance redirects, Python for analytics and dashboard, Node.js for URL metadata enrichment, and Redis for event-driven communication and caching.
+This repository extends the [URL shortener microservices demo](README-APP.md) into an experiment that compares two Kubernetes autoscalers on the same workload:
 
-## Architecture
+- **HPA**: the standard, reactive Horizontal Pod Autoscaler.
+- **PHPA**: the [Predictive Horizontal Pod Autoscaler](https://github.com/jthomperoo/predictive-horizontal-pod-autoscaler), which uses a linear-regression model over recent replica history.
 
-This project demonstrates a realistic microservice architecture where different services handle their specific responsibilities:
+The measured workload is only the **Go redirect service**. It runs on a single-node Minikube cluster and is loaded with [k6](https://k6.io). Prometheus collects metrics, and a Python script turns each run into CSV summaries.
 
-### Services
+For the original application (Go, Python, Node and Redis services, the dashboard and the API), see [README-APP.md](README-APP.md).
 
-**Go Service (Port 8000)**
+---
 
-- **Purpose**: Fast URL redirection and creation
-- **Database**: `go.db` (SQLite)
-- **Responsibilities**:
-  - Generate and store short codes
-  - Handle URL redirects with minimal latency
-  - Send click events to Python service asynchronously
-- **Technology**: Go with Gin framework
-
-**Python Service (Port 5000)**
-
-- **Purpose**: Analytics, data aggregation, and user interface
-- **Database**: `python.db` (SQLite)
-- **Responsibilities**:
-  - Provide web dashboard for URL creation
-  - Orchestrate URL creation (call Go) and metadata fetching (call Node.js)
-  - Subscribe to Redis click events channel
-  - Collect and aggregate click events
-  - Display analytics and statistics with metadata
-  - Generate visualizations
-  - HTTP fallback endpoint for events
-- **Technology**: Python with Flask, redis-py
-
-**Node.js Service (Port 3000)**
-
-- **Purpose**: URL metadata enrichment
-- **Database**: `node.db` (SQLite)
-- **Responsibilities**:
-  - Fetch page titles, descriptions, and favicons from URLs
-  - Parse HTML content with Cheerio
-  - Store and serve metadata via REST API
-- **Technology**: Node.js with Express, Axios, Cheerio
-
-### Microservice Communication
-
-**URL Creation (Synchronous):**
+## Project structure
 
 ```
-User → Python Dashboard
-         ↓
-         ├→ Go Service → Create Short URL → go.db
-         └→ Node.js Service → Fetch Metadata → node.db
-         ↓
-    Display URL + Metadata in UI
+URLshortner-microservices/
+├── README.md                     This file
+├── README-APP.md                 Original app documentation (upstream)
+├── docker-compose.yml            Runs the full app locally (not used by the experiment)
+├── sonar-project.properties      SonarCloud config
+├── .github/workflows/
+│   ├── deploy.yml                Builds and pushes Docker images on push to main
+│   └── sonar.yml                 SonarCloud scan
+│
+├── go-service/                   ★ The workload under test
+│   ├── main.go                   Gin app: /api/shorten, /:code redirect, /health
+│   ├── Dockerfile                Multi-stage build (CGO enabled for SQLite)
+│   └── go.mod / go.sum
+├── python-service/               Dashboard and analytics (demo only, not measured)
+├── node-service/                 URL metadata fetcher (demo only, not measured)
+│
+├── k8s/                          ★ Cluster manifests, run scripts, analysis
+│   ├── go-service-deployment.yaml    go-service and Redis Deployments and Services
+│   ├── go-service-hpa.yaml           HPA definition
+│   ├── go-service-phpa.yaml          PHPA definition
+│   ├── services-deployment.yaml      node-service and python-service (demo only)
+│   ├── reset-between-runs.sh         Returns the cluster to a clean baseline, then applies HPA or PHPA
+│   ├── watch-pods-during-run.sh      Snapshots pods every 3s during a run
+│   ├── collect-run-data.sh           Pulls Prometheus metrics and k8s events for a run window
+│   ├── analyze_results.py            Builds summary.csv, comparison.csv and pct_diff.csv
+│   └── results*/                     Raw run data (not in git; see below)
+│
+├── k6/                           Short load scenarios (~3–4 min each)
+│   ├── pilot-script.js               Constant 20 VUs for 90s, used for calibration
+│   ├── scenario-a-steady.js          A: steady at 5 VUs
+│   ├── scenario-b-spike.js           B: spike from 5 to 30 VUs
+│   └── scenario-c-fluctuating.js     C: 5 → 15 → 30 → 5 → 30 → 5 VUs
+└── k6-long/                      Long variants of A, B and C (~5–7 min each)
 ```
 
-**Click Events (Event-Driven with Redis):**
+### Results data (not in git)
 
-```
-User clicks → Go Service
-                ↓
-            1. Check Redis cache
-               ├─ Hit: Instant redirect ⚡
-               └─ Miss: Query DB → Cache in Redis
-                ↓
-            2. Publish to Redis "click_events"
-                ↓
-            Redis Pub/Sub
-                ↓
-            Python subscribes → Process event → python.db
-```
+The `k8s/results*/` folders are listed in `.gitignore` and kept only on the experiment VM (about 51 MB). They are:
 
-**Communication Patterns:**
+| Folder | Contents |
+|---|---|
+| `results/` | Primary set, 21 Jul (3 repetitions × 3 scenarios × 2 autoscalers) |
+| `results-long/` | Long-duration set, 16 Aug (1 repetition each) |
+| `results-extended-c/` | Extended Scenario C, 17 and 26 Aug |
+| `results-extended-c-0831/` | Extended Scenario C, HPA rerun on 31 Aug |
 
-- **Python → Go**: HTTP POST (URL creation - needs immediate response)
-- **Python → Node.js**: HTTP POST (metadata fetch - synchronous)
-- **Go → Redis**: Pub/Sub publish (click events - decoupled)
-- **Redis → Python**: Pub/Sub subscribe (click events - async processing)
-- **Go → Redis**: Cache (URL lookups - performance)
-- **Fallback**: HTTP POST if Redis unavailable
-- **No direct database sharing**: Each service owns its data
+### Changes made to go-service for the experiment
 
-## Features
+| Feature | Env var | Default in code | Value in deployment | Purpose |
+|---|---|---|---|---|
+| `burnCPU()` | `CPU_LOAD_ITERATIONS` | `20000` | `3000` | SHA-256 rounds per redirect, so the endpoint is CPU-bound and the autoscalers have a signal to react to |
+| `seedDatabase()` | `SEED_COUNT` | `1000` | `1000` | Preloads `loadtest0001`…`loadtest1000` identically in every pod, so load tests never hit the write path |
+| `/health` | none | none | none | Readiness and liveness probe that pings the database |
+| Short URL base | `PUBLIC_BASE_URL` | `http://localhost:8000` | `http://10.251.70.226:8000` | Host used in the returned short URLs |
+| Redis address | `REDIS_URL` | `localhost:6380` | `redis:6379` | Redis cache and pub/sub |
 
-- ✅ Create short URLs through web dashboard
-- ✅ **Lightning-fast redirects with Redis caching** ⚡
-- ✅ **Event-driven architecture with Redis Pub/Sub**
-- ✅ **Never lose events** - Redis queues them if Python is down
-- ✅ URL metadata enrichment via Node.js (titles, descriptions, favicons)
-- ✅ Real-time analytics dashboard
-- ✅ Click tracking and history
-- ✅ Visual charts for click patterns
-- ✅ Top URLs by popularity with page info
-- ✅ Recent activity monitoring
-- ✅ Auto-refreshing dashboard (every 5 seconds)
-- ✅ Visual indicators showing Node.js service status
-- ✅ **Graceful degradation** - HTTP fallback if Redis unavailable
+Pods deliberately have **no shared volume**. Each pod seeds its own SQLite file, which avoids write contention between replicas.
+
+### Autoscaler settings
+
+HPA and PHPA are configured the same way wherever both support a setting:
+
+| Setting | Value |
+|---|---|
+| Target | 60% average CPU utilisation, relative to the 100m CPU request |
+| Replicas | 1 to 5 |
+| Scale up | No stabilisation window, up to +100% every 15s |
+| Scale down | 300s stabilisation window, up to −50% every 60s |
+| PHPA only | Linear model, `historySize: 6`, `lookAhead: 15s`, `syncPeriod: 15s`, `decisionType: maximum` |
+
+Pod resources are requests of 100m CPU and 64Mi memory, with limits of 300m CPU and 128Mi memory.
+
+---
 
 ## Prerequisites
 
-- **Go**: Version 1.24 or higher
-- **Python**: Version 3.14 (or 3.8+)
-- **Node.js**: Version 24.11 or higher (with npm)
-- **Redis**: Version 7 or higher (for local: localhost:6380)
-- **SQLite**: Built-in with Go, Python, and Node.js
-- **Docker & Docker Compose**: For containerized deployment (recommended)
+The versions below are what the VM uses:
 
-## Installation & Setup
-
-### Option 1: Docker (Recommended) 🐳
-
-**Prerequisites:**
-
-- Docker
-- Docker Compose
-
-**Quick Start:**
-
-```bash
-# Navigate to project
-cd /home/xaadu/codes/urlshortner
-
-# Build and start all services
-docker-compose up --build
-
-# Or run in background
-docker-compose up --build -d
-```
-
-**Access the application:**
-
-- Dashboard: `http://localhost:5000`
-- Go Service: `http://localhost:8000`
-- Node.js Service: `http://localhost:3000`
-
-**Useful Docker Commands:**
-
-```bash
-# View logs
-docker-compose logs -f
-
-# View logs for specific service
-docker-compose logs -f python-service
-
-# Stop all services
-docker-compose down
-
-# Stop and remove volumes (deletes databases)
-docker-compose down -v
-
-# Rebuild after code changes
-docker-compose up --build
-```
-
-**How it works:**
-
-- Each service runs in its own container
-- Services communicate via Docker network using container names
-- Databases persist in Docker volumes
-- All services start together with one command!
+| Tool | Version | Notes |
+|---|---|---|
+| Ubuntu | 26.04 | VM, 3 CPU and 5 GB RAM given to Minikube |
+| Docker | 29.x | Minikube driver and image builds |
+| Minikube | v1.38 | |
+| kubectl | v1.36 | |
+| Helm | v4.3 | For Prometheus and the PHPA operator |
+| k6 | any recent version | Run where it can reach go-service (see step 5) |
+| Python 3 | 3.10 or newer | For `analyze_results.py` (standard library only) |
+| jq, curl | any | Used by `collect-run-data.sh` |
 
 ---
 
-### Option 2: Local Development (Without Docker)
+## One-time setup
 
-### 1. Clone or navigate to the project
+### 1. Start Minikube and metrics-server
 
 ```bash
-cd /home/xaadu/codes/urlshortner
+minikube start --driver=docker --cpus=3 --memory=5000mb
+minikube addons enable metrics-server
+kubectl top nodes          # confirm metrics are coming through
 ```
 
-### 2. Setup Go Service
+### 2. Install monitoring (Prometheus and Grafana)
 
 ```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+helm install monitoring prometheus-community/kube-prometheus-stack \
+  -n monitoring --create-namespace
+```
+
+`collect-run-data.sh` expects Prometheus at `http://localhost:9090`. Forward it with:
+
+```bash
+kubectl port-forward --address 0.0.0.0 -n monitoring \
+  svc/monitoring-kube-prometheus-prometheus 9090:9090
+```
+
+On the VM this port-forward runs as the systemd unit `prometheus-forward.service`. Similar units exist for go-service (`go-service-forward.service`, port 8000), Grafana (port 3000) and python-service (port 5000).
+
+Get the Grafana admin password with:
+
+```bash
+kubectl get secret -n monitoring monitoring-grafana \
+  -o jsonpath="{.data.admin-password}" | base64 --decode; echo
+```
+
+### 3. Install the PHPA operator
+
+```bash
+VERSION=<release tag>   # see https://github.com/jthomperoo/predictive-horizontal-pod-autoscaler/releases
+helm install phpa-operator \
+  https://github.com/jthomperoo/predictive-horizontal-pod-autoscaler/releases/download/${VERSION}/predictive-horizontal-pod-autoscaler-${VERSION}.tgz
+kubectl get pods -l name=predictive-horizontal-pod-autoscaler
+```
+
+### 4. Build the image and deploy go-service
+
+Images are built locally and loaded into Minikube; they are never pulled from a registry (`imagePullPolicy: Never`).
+
+```bash
+kubectl create namespace phpa-experiment
+kubectl config set-context --current --namespace=phpa-experiment
+
 cd go-service
+docker build -t go-service:test .
+minikube image load go-service:test
+cd ..
 
-# Download dependencies
-go mod download
-
-# Run the service
-go run main.go
+kubectl apply -f k8s/go-service-deployment.yaml
+kubectl run curl-test --image=curlimages/curl -it --rm --restart=Never \
+  -- curl http://go-service:8000/health      # expect {"status":"healthy",...}
 ```
 
-The Go service will start on `http://localhost:8000`
-
-### 3. Setup Python Service
-
-Open a new terminal:
+If the VM's IP changes, update `PUBLIC_BASE_URL`:
 
 ```bash
-cd /home/xaadu/codes/urlshortner/python-service
-
-# Create virtual environment (following user preference)
-python3.14 -m venv venv
-
-# Activate virtual environment
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run the service
-python app.py
+kubectl set env deployment/go-service PUBLIC_BASE_URL=http://<vm-ip>:8000
 ```
 
-The Python service will start on `http://localhost:5000`
-
-### 4. Setup Redis (Local Development)
-
-```bash
-# User has Redis running at localhost:6380
-# Services will automatically connect to it
-# No additional setup needed!
-```
-
-### 5. Setup Node.js Service
-
-Open a new terminal:
-
-```bash
-cd /home/xaadu/codes/urlshortner/node-service
-
-# Install dependencies
-npm install
-
-# Run the service
-node server.js
-```
-
-The Node.js service will start on `http://localhost:3000`
+The demo services (`k8s/services-deployment.yaml`) are optional. **Scale them to zero or delete them before measured runs** so they don't use cluster headroom.
 
 ---
 
-## Usage
+## Running a measured run
 
-### Access the Dashboard
+Every run follows the same five steps. Run the scripts from the `k8s/` folder, because they reference the YAML files by relative path.
 
-Open your browser and navigate to:
+### Run IDs
 
-```
-http://localhost:5000
-```
-
-### Create a Short URL
-
-1. Enter a long URL in the input field
-2. Click "Shorten"
-3. Copy the generated short URL
-
-### Test the Redirect
-
-Visit the short URL in your browser:
+Name runs `<YYYYMMDD>_<scenario>_<autoscaler>_r<n>`, with an optional tag before `_r<n>`:
 
 ```
-http://localhost:8000/{short_code}
+20260721_A_hpa_r1          primary set
+20260816_B_phpa_long_r1    long set
+20260817_C_ext_hpa_r1      extended Scenario C
 ```
 
-You'll be redirected to the original URL, and the click will be tracked in the analytics.
+`analyze_results.py` works out the scenario (`A`/`B`/`C`), autoscaler (`hpa`/`phpa`) and repetition from this name, so keep to the pattern.
 
-### View Analytics
-
-The dashboard automatically shows:
-
-- Total URLs created
-- Total clicks
-- **Page metadata (titles, favicons) fetched by Node.js**
-- Clicks over time (24-hour chart)
-- Top URLs by popularity with page info
-- All created URLs with metadata status indicators
-- Recent click activity
-
-The dashboard refreshes every 5 seconds automatically.
-
-**Visual Indicators:**
-
-- ✅ Green badge "✓ Node.js" = Metadata successfully fetched
-- ❌ Red badge "✗" = Metadata fetch failed
-- Favicon icons displayed next to page titles
-
-## API Endpoints
-
-### Go Service (Port 8000)
-
-**Create Short URL**
+### Step by step
 
 ```bash
-POST /api/shorten
-Content-Type: application/json
+cd k8s
+RUN_ID=20260901_B_hpa_r1
+RESULTS=results-new          # results folder for this batch
+DURATION=340                 # scenario length plus about 30s of buffer
 
-{
-  "long_url": "https://example.com/very/long/url"
-}
+# 1. Reset to baseline and apply the autoscaler (hpa or phpa).
+#    Removes both autoscalers, deletes PHPA's history ConfigMap, scales to
+#    1 replica, waits 60s for CPU to settle, then applies the chosen autoscaler.
+./reset-between-runs.sh hpa
 
-Response:
-{
-  "short_code": "abc123",
-  "short_url": "http://localhost:8000/abc123",
-  "long_url": "https://example.com/very/long/url"
-}
+# 2. Start the pod watcher in the background
+./watch-pods-during-run.sh $RUN_ID $DURATION $RESULTS &
+
+# 3. Run k6 and record the start and end timestamps
+START=$(date +%s)
+k6 run -e BASE_URL=http://<vm-ip>:8000 \
+  --summary-export=scenario-b-hpa-r1.json ../k6/scenario-b-spike.js
+END=$(date +%s)
+
+# 4. Collect metrics immediately (Kubernetes only keeps events for about 1 hour)
+./collect-run-data.sh $RUN_ID $START $END $RESULTS
+
+# 5. Copy the k6 summary into the run folder
+cp scenario-b-hpa-r1.json $RESULTS/$RUN_ID/
 ```
 
-**Redirect**
+**Important:**
+
+- The k6 summary file must be named `scenario-*.json` or `k6_summary.json`, and it must be the **only** such file in the run folder. The analysis script reads the first match it finds.
+- Alternate HPA and PHPA runs, and always run `reset-between-runs.sh` between them. Otherwise PHPA's replica history leaks from one run into the next.
+- If k6 runs on a different machine from the VM, take `START` and `END` on the VM (`date +%s`), because Prometheus timestamps use the VM clock.
+
+### Running k6 inside the cluster (alternative)
+
+The calibration runs used a k6 pod inside the cluster, with the script mounted from a ConfigMap:
 
 ```bash
-GET /{short_code}
-# Redirects to the long URL and sends event to Python service
+kubectl create configmap k6-scenario-a --from-file=scenario-a.js=../k6/scenario-a-steady.js
+kubectl run k6-test --image=grafana/k6 --restart=Never --overrides='{
+  "spec": {
+    "containers": [{
+      "name": "k6-test", "image": "grafana/k6",
+      "command": ["k6", "run", "/scripts/scenario-a.js"],
+      "volumeMounts": [{"name": "script", "mountPath": "/scripts"}]
+    }],
+    "volumes": [{"name": "script", "configMap": {"name": "k6-scenario-a"}}]
+  }
+}'
+kubectl logs -f k6-test
 ```
 
-### Python Service (Port 5000)
+The default `BASE_URL` in the scripts is `http://go-service:8000`, so no `-e` flag is needed in the cluster. The summary only appears in the pod logs, though. For runs you plan to analyse, use `--summary-export` from outside the cluster as shown above.
 
-**Dashboard**
+### Calibrating the CPU load
+
+To change how much CPU each redirect costs:
 
 ```bash
-GET /
-# Returns the web dashboard
+kubectl set env deployment/go-service CPU_LOAD_ITERATIONS=3000
+watch -n 2 kubectl top pod -l app=go-service
 ```
 
-**Create URL (from UI)**
+The aim is for Scenario A (5 VUs) to stay **below** the 60% target while Scenarios B and C (30 VUs) push above it.
+
+---
+
+## Analysing results
 
 ```bash
-POST /create
-Content-Type: application/x-www-form-urlencoded
-
-long_url=https://example.com
+cd k8s
+python3 analyze_results.py results-new
 ```
 
-**Receive Click Event**
+The script prints three tables and writes three files into the same folder:
 
-```bash
-POST /api/events
-Content-Type: application/json
+| File | Contents |
+|---|---|
+| `summary.csv` | One row per run |
+| `comparison.csv` | Mean, median and standard deviation per scenario and autoscaler |
+| `pct_diff.csv` | PHPA vs HPA % difference per scenario, as `(phpa − hpa) / hpa × 100` |
 
-{
-  "short_code": "abc123",
-  "clicked_at": "2025-11-08T12:00:00Z"
-}
-```
+### Metrics
 
-**Get Statistics**
+| Metric | Source | How it is calculated |
+|---|---|---|
+| `mean_cpu_utilization_pct` | Prometheus | Mean of total CPU usage ÷ total CPU requested, over the run |
+| `p95_latency_ms`, `throughput_rps`, `error_rate_pct` | k6 summary | Taken directly from k6 |
+| `scale_up_events` | k8s events | Count of "Scaled up" events within the run window |
+| `mean_scaling_delay_s` | Events and pod snapshots | Time from a scale-up event to the first **new** pod becoming Ready |
+| `replica_minutes` | Prometheus | Sum of replicas × sampling interval |
+| `cpu_waste_pct` | Prometheus | (requested − used CPU) ÷ requested CPU |
+| `estimated_cost_usd` | Derived | From replica-minutes at an illustrative $0.024 per core-hour and $0.003 per GB-hour. **Only useful for comparison, not a real bill.** |
 
-```bash
-GET /api/stats
-
-Returns JSON with:
-- total_urls
-- total_clicks
-- top_urls (with metadata)
-- recent_clicks
-- clicks_over_time
-- all_urls (with metadata)
-```
-
-### Node.js Service (Port 3000)
-
-**Fetch Metadata**
-
-```bash
-POST /api/metadata
-Content-Type: application/json
-
-{
-  "short_code": "abc123",
-  "long_url": "https://example.com"
-}
-
-Response:
-{
-  "short_code": "abc123",
-  "url": "https://example.com",
-  "title": "Example Domain",
-  "description": "Example domain for documentation",
-  "favicon_url": "https://example.com/favicon.ico",
-  "status": "success"
-}
-```
-
-**Get Metadata**
-
-```bash
-GET /api/metadata/{short_code}
-# Returns stored metadata for a short code
-```
-
-**Health Check**
-
-```bash
-GET /health
-# Returns service health status
-```
-
-## Database Schema
-
-### Go Service (go.db)
-
-```sql
-CREATE TABLE urls (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    short_code TEXT UNIQUE NOT NULL,
-    long_url TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-### Python Service (python.db)
-
-```sql
-CREATE TABLE click_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    short_code TEXT NOT NULL,
-    clicked_at DATETIME NOT NULL
-);
-
-CREATE TABLE url_metadata (
-    short_code TEXT PRIMARY KEY,
-    long_url TEXT NOT NULL,
-    total_clicks INTEGER DEFAULT 0,
-    first_seen DATETIME NOT NULL,
-    last_clicked DATETIME,
-    title TEXT,
-    description TEXT,
-    favicon_url TEXT,
-    metadata_status TEXT DEFAULT 'pending'
-);
-```
-
-### Node.js Service (node.db)
-
-```sql
-CREATE TABLE metadata (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    short_code TEXT UNIQUE NOT NULL,
-    url TEXT NOT NULL,
-    title TEXT,
-    description TEXT,
-    favicon_url TEXT,
-    fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-## Microservice Design Principles Demonstrated
-
-1. **Service Independence**: Each service has its own database and can run independently
-2. **Single Responsibility**: Go=Redirects, Python=Analytics/UI, Node.js=Metadata, Redis=Messaging
-3. **Event-Driven Architecture**: Redis Pub/Sub for decoupled async communication
-4. **API Communication**: Services communicate via REST APIs for synchronous operations
-5. **Service Orchestration**: Python orchestrates calls to both Go and Node.js
-6. **Message Broker**: Redis as central message bus (industry-standard pattern)
-7. **Caching Strategy**: Redis caching layer for performance optimization
-8. **Graceful Degradation**: System works even if Redis or Node.js unavailable
-9. **Data Ownership**: Each service owns and manages its own data
-10. **Scalability**: Services can be scaled independently, Redis enables horizontal scaling
-11. **Containerization**: Each service runs in isolated Docker containers
-12. **Environment Configuration**: Services use environment variables for Docker/local flexibility
-13. **Resilience**: Events never lost - queued in Redis until processed
-
-## Testing the System
-
-### Docker Testing
-
-If you're running with Docker:
-
-```bash
-# Start services
-docker-compose up --build
-
-# In another terminal, test with curl
-curl -X POST http://localhost:5000/create -d "long_url=https://github.com"
-
-# Watch logs in real-time
-docker-compose logs -f
-
-# View specific service logs
-docker-compose logs go-service
-docker-compose logs python-service
-docker-compose logs node-service
-```
-
-### Test URL Creation and Redirection
-
-```bash
-# Create a short URL
-curl -X POST http://localhost:5000/create \
-  -d "long_url=https://github.com"
-
-# Test redirect (will open in browser)
-curl -L http://localhost:8000/{returned_short_code}
-
-# Check analytics
-curl http://localhost:5000/api/stats
-```
-
-### Verify Microservice Communication
-
-1. Create a URL through the Python dashboard (e.g., https://github.com)
-2. Check Go service logs - you should see the URL creation
-3. Check Node.js service logs - you should see metadata fetching
-4. Check Python service logs - you should see metadata stored
-5. Look at the dashboard - you should see the page title and favicon
-6. Click the short URL
-7. Check Go service logs - you should see the redirect and event sending
-8. Check Python service logs - you should see the click event received
-9. Refresh the dashboard - you should see updated analytics with metadata
-
-**Testing Node.js Service Separately:**
-
-```bash
-# Test metadata fetching directly
-curl -X POST http://localhost:3000/api/metadata \
-  -H "Content-Type: application/json" \
-  -d '{"short_code":"test123","long_url":"https://github.com"}'
-
-# Check health
-curl http://localhost:3000/health
-```
-
-## Project Structure
+### Files in each run folder
 
 ```
-/home/xaadu/codes/urlshortner/
-├── README.md
-├── docker-compose.yml    # Docker Compose with 4 services (includes Redis!)
-├── go-service/
-│   ├── Dockerfile        # Go container with CGO for SQLite
-│   ├── .dockerignore     # Docker ignore file
-│   ├── main.go           # Go app with Redis pub/sub & caching
-│   ├── go.mod            # Go dependencies (includes go-redis)
-│   ├── go.sum            # Go dependency checksums
-│   └── go.db             # SQLite database (created at runtime)
-├── python-service/
-│   ├── Dockerfile        # Python container
-│   ├── .dockerignore     # Docker ignore file
-│   ├── app.py            # Flask app with Redis subscriber
-│   ├── requirements.txt   # Python deps (Flask, requests, redis)
-│   ├── python.db         # SQLite database (created at runtime)
-│   └── templates/
-│       └── dashboard.html # Web dashboard UI with metadata display
-└── node-service/
-    ├── Dockerfile        # Node.js container
-    ├── .dockerignore     # Docker ignore file
-    ├── server.js         # Express application (metadata fetching)
-    ├── package.json      # Node.js dependencies
-    └── node.db           # SQLite database (created at runtime)
+<RUN_ID>/
+├── cpu_usage.json                    Prometheus: CPU cores per pod
+├── cpu_utilization_pct.json          Prometheus: % of CPU request
+├── memory_usage.json                 Prometheus: working-set bytes per pod
+├── replica_count.json                Prometheus: Deployment replicas over time
+├── deployment_events.json            kubectl events for go-service
+├── pod_timestamps.json               Pod snapshot taken after the run
+├── pod_snapshots_continuous.jsonl    Snapshots every 3s during the run (Aug runs onwards)
+├── hpa_status.json / phpa_status.json   Autoscaler state; the unused one is empty
+└── scenario-*.json                   k6 summary
 ```
 
-## Technologies Used
+---
 
-- **Go 1.24**: High-performance backend
-  - Gin web framework
-  - SQLite3 driver
-  - Alpine Linux (Docker base)
-- **Python 3.14**: Analytics and UI
-  - Flask web framework
-  - Requests library
-  - SQLite3 (built-in)
-  - Slim Debian (Docker base)
-- **Node.js 24.11**: Metadata service
-  - Express web framework
-  - Axios (HTTP client)
-  - Cheerio (HTML parsing)
-  - SQLite3 driver
-  - Alpine Linux (Docker base)
-- **Redis 7**: Message broker and cache
-  - Pub/Sub for event-driven architecture
-  - Caching layer for performance
-  - Persistence with AOF (Append-Only File)
-- **Docker & Docker Compose**: Containerization and orchestration
-- **SQLite**: Lightweight database for all three services
-- **Chart.js**: Data visualization
-- **Modern CSS**: Responsive dashboard design
+## Scenarios at a glance
 
-## Future Enhancements
+| Scenario | Short (`k6/`) | Long (`k6-long/`) | What it tests |
+|---|---|---|---|
+| **A: Steady** | 30s ramp, 3m at 5 VUs, 30s ramp down | 6m hold | Normal operation, over-provisioning |
+| **B: Spike** | 30s at 5, jump to 30 in 10s, hold 2m, back to 5 | 4m hold | Reaction speed, scaling delay |
+| **C: Fluctuating** | 30s stages: 5 → 15 → 30 → 5 → 30 → 5 | 60s stages | How stable the predictions are under repeated swings |
 
-- Add Redis for message queue between services
-- Implement rate limiting
-- Add user authentication
-- Support custom short codes
-- Add geographic tracking
-- Implement URL expiration
-- Add bulk URL creation
-- Export analytics reports
+Every scenario requests random seeded codes with `redirects: 0`, so k6 measures go-service's own 301 response rather than the external redirect target.
 
-## Author
+---
 
-[Abdullah Zayed (zayedabdullah.com)](https://zayedabdullah.com)
-Contact: [Email (contact@zayedabdullah.com)](mailto:contact@zayedabdullah.com) | [GitHub (xaadu)](https://github.com/xaadu) | [LinkedIn (abdullahzayed01)](https://www.linkedin.com/in/abdullahzayed01/)
+## Known caveats
 
-## Contributing
-
-Contributions are welcome! Please feel free to submit a pull request.
-
-## Support
-
-If you find this project useful, please consider supporting me with a star or a follow.
-
-## License
-
-MIT License - Free to use for educational purposes
+- **Scaling-delay figures in `results/` (21 Jul) are not reliable.** Those runs were collected before `watch-pods-during-run.sh` existed, so they fall back to a single snapshot taken after the run. Several HPA delays exceed the run length (500–1800s). Treat `mean_scaling_delay_s` from that set with caution. The August sets use continuous snapshots and filter events to the run window.
+- **The long and extended sets have one repetition each,** so their standard deviations are not meaningful.
+- **The extended Scenario C runs were not paired on the same day** (PHPA on 17 Aug, HPA on 26 Aug). `results-extended-c-0831/` holds a later HPA rerun that is not yet in any summary.
+- **`CPU_LOAD_ITERATIONS` differs by location:** the code default is 20000, the deployment YAML sets 3000, and the k6 comments mention 1500. Before quoting it, confirm the running value with:
+  ```bash
+  kubectl get deployment go-service -o jsonpath='{.spec.template.spec.containers[0].env}'
+  ```
+- `PUBLIC_BASE_URL` is hard-coded to the VM's IP. Update it if the network changes.
