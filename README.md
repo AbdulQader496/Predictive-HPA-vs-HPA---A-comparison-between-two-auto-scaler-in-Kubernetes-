@@ -197,14 +197,13 @@ Name runs `<YYYYMMDD>_<scenario>_<autoscaler>_r<n>`, with an optional tag before
 
 ```bash
 cd k8s
-RUN_ID=20260901_B_hpa_r1
+AUTOSCALER=hpa               # hpa or phpa
+RUN_ID=20260901_B_${AUTOSCALER}_r1
 RESULTS=results-new          # results folder for this batch
 DURATION=340                 # scenario length plus about 30s of buffer
 
-# 1. Reset to baseline and apply the autoscaler (hpa or phpa).
-#    Removes both autoscalers, deletes PHPA's history ConfigMap, scales to
-#    1 replica, waits 60s for CPU to settle, then applies the chosen autoscaler.
-./reset-between-runs.sh hpa
+# 1. Reset to baseline and apply the chosen autoscaler (see the table below)
+./reset-between-runs.sh $AUTOSCALER
 
 # 2. Start the pod watcher in the background
 ./watch-pods-during-run.sh $RUN_ID $DURATION $RESULTS &
@@ -212,14 +211,38 @@ DURATION=340                 # scenario length plus about 30s of buffer
 # 3. Run k6 and record the start and end timestamps
 START=$(date +%s)
 k6 run -e BASE_URL=http://<vm-ip>:8000 \
-  --summary-export=scenario-b-hpa-r1.json ../k6/scenario-b-spike.js
+  --summary-export=scenario-b-${AUTOSCALER}-r1.json ../k6/scenario-b-spike.js
 END=$(date +%s)
 
 # 4. Collect metrics immediately (Kubernetes only keeps events for about 1 hour)
 ./collect-run-data.sh $RUN_ID $START $END $RESULTS
 
 # 5. Copy the k6 summary into the run folder
-cp scenario-b-hpa-r1.json $RESULTS/$RUN_ID/
+cp scenario-b-${AUTOSCALER}-r1.json $RESULTS/$RUN_ID/
+```
+
+For the matching PHPA run, set `AUTOSCALER=phpa` and repeat the same five steps.
+
+### What the reset script does for HPA and PHPA
+
+`./reset-between-runs.sh hpa` and `./reset-between-runs.sh phpa` share the same baseline steps. PHPA gets one extra wait at the end:
+
+| Step | `hpa` | `phpa` |
+|---|---|---|
+| Delete leftover `k6-test` / `k6-calibrate` pods | ✓ | ✓ |
+| Delete **both** autoscaler objects (`go-service-hpa`, `go-service-phpa`) | ✓ | ✓ |
+| Delete PHPA's replica-history ConfigMap (`predictive-horizontal-pod-autoscaler-go-service-phpa-data`) | ✓ | ✓ |
+| Scale go-service to 1 replica and wait for the rollout | ✓ | ✓ |
+| Wait 60s for CPU to settle, then check pods are Ready | ✓ | ✓ |
+| Apply the autoscaler | `go-service-hpa.yaml` | `go-service-phpa.yaml` |
+| Wait one PHPA sync period (15s) so it starts cleanly | none | ✓ |
+
+The ConfigMap is cleared on **every** reset, including HPA resets. PHPA's linear model predicts from this stored replica history, so a leftover history would carry the previous run's replica counts into the next PHPA run and break independence between repetitions.
+
+After the reset, confirm the right autoscaler is active:
+
+```bash
+kubectl get hpa,phpa -n phpa-experiment     # only one of the two should be listed
 ```
 
 **Important:**
